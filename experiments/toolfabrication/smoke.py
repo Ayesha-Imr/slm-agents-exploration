@@ -62,8 +62,13 @@ def load_bfcl(filename):
 def item_question(item):
     q = item.get("question") or item.get("conversations")
     if isinstance(q, list) and q:
-        d = q[0]
-        return d.get("text") or d.get("content") or ""
+        first = q[0]
+        if isinstance(first, dict):
+            return first.get("text") or first.get("content") or ""
+        if isinstance(first, list) and first:
+            d = first[0]
+            if isinstance(d, dict):
+                return d.get("text") or d.get("content") or ""
     return ""
 
 
@@ -307,38 +312,46 @@ def main():
 
     y_call = np.array([1 if l in ("fabricated", "correct", "wrong_tool") else 0
                        for l in labels])
-    auc_call = probe_aucs(P, y_call, range(n_layers))
-    best_call = int(np.argmax(auc_call))
+    if y_call.sum() >= 4 and (len(y_call) - y_call.sum()) >= 4:
+        auc_call = probe_aucs(P, y_call, range(n_layers))
+        best_call = int(np.argmax(auc_call))
+    else:
+        auc_call, best_call = None, None
     print(f"[{time.time()-t2:.0f}s] H2 probes: fab-vs-valid best L={best_fab} "
           f"AUROC={auc_fab_prompt[best_fab]:.3f} (prompt-final) | "
-          f"call-vs-nocall best L={best_call} AUROC={auc_call[best_call]:.3f}",
+          + (f"call-vs-nocall best L={best_call} AUROC={auc_call[best_call]:.3f}"
+             if auc_call is not None else "call-vs-nocall skipped (class imbalance)"),
           flush=True)
 
     # ---- Phase 3: steering (H3) ----
     t3 = time.time()
     call_idx = [i for i, l in enumerate(labels) if l in ("fabricated", "correct", "wrong_tool")]
     nocall_idx = [i for i, l in enumerate(labels) if l == "no_call"]
-    mean_call = P[call_idx, best_call].mean(axis=0)
-    mean_nocall = P[nocall_idx, best_call].mean(axis=0)
-    tool_dir = mean_call - mean_nocall
-    tool_dir = tool_dir / (np.linalg.norm(tool_dir) + 1e-8)
-
-    steer_pool = [q for q in queries if q["category"] in ("irrel", "live_irrel")]
-    steer_pool = rng.sample(steer_pool, min(args.n_steer_tool, len(steer_pool)))
     steer_tool = {}
-    for alpha in (0.0, 1.0, 2.0):
-        labs = []
-        for q in steer_pool:
-            text, _, _ = gen(model, tok, q["prompt"], max_new_tokens=220,
-                             steer_layer=best_call, steer_dir=tool_dir, steer_alpha=alpha)
-            lab, _ = label_output(text, q["registry"], q["gts"])
-            labs.append(lab)
-        steer_tool[str(alpha)] = {
-            "call_rate": sum(1 for l in labs if l in ("fabricated", "correct", "wrong_tool"))
-                         / len(labs),
-            "fabricated_rate": labs.count("fabricated") / len(labs),
-        }
-    print(f"[{time.time()-t3:.0f}s] H3a toolness steering: {json.dumps(steer_tool)}", flush=True)
+    if best_call is None or not call_idx or not nocall_idx:
+        print(f"[{time.time()-t3:.0f}s] H3a toolness steering: SKIPPED "
+              f"(no call/nocall contrast)", flush=True)
+    else:
+        mean_call = P[call_idx, best_call].mean(axis=0)
+        mean_nocall = P[nocall_idx, best_call].mean(axis=0)
+        tool_dir = mean_call - mean_nocall
+        tool_dir = tool_dir / (np.linalg.norm(tool_dir) + 1e-8)
+
+        steer_pool = [q for q in queries if q["category"] in ("irrel", "live_irrel")]
+        steer_pool = rng.sample(steer_pool, min(args.n_steer_tool, len(steer_pool)))
+        for alpha in (0.0, 1.0, 2.0):
+            labs = []
+            for q in steer_pool:
+                text, _, _ = gen(model, tok, q["prompt"], max_new_tokens=220,
+                                 steer_layer=best_call, steer_dir=tool_dir, steer_alpha=alpha)
+                lab, _ = label_output(text, q["registry"], q["gts"])
+                labs.append(lab)
+            steer_tool[str(alpha)] = {
+                "call_rate": sum(1 for l in labs if l in ("fabricated", "correct", "wrong_tool"))
+                             / len(labs),
+                "fabricated_rate": labs.count("fabricated") / len(labs),
+            }
+        print(f"[{time.time()-t3:.0f}s] H3a toolness steering: {json.dumps(steer_tool)}", flush=True)
 
     # grounding steering: push valid-call queries toward the "fabricated" side
     t3b = time.time()
@@ -418,8 +431,9 @@ def main():
                                      "best_layer": int(best_fab_first),
                                      "best_auc": float(auc_fab_first[best_fab_first])}
         if auc_fab_first else None,
-        "h2_probe_call_vs_nocall": {"best_layer": int(best_call),
-                                    "best_auc": float(auc_call[best_call])},
+        "h2_probe_call_vs_nocall": ({"best_layer": int(best_call),
+                                     "best_auc": float(auc_call[best_call])}
+                                    if auc_call is not None else None),
         "h3a_steer_toolness": steer_tool,
         "h3b_steer_grounding": steer_ground,
         "h4_corruption": {"fabricated_rate": float(fab_corrupt) if fab_corrupt is not None
