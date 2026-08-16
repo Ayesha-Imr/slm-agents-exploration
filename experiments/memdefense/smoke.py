@@ -439,6 +439,9 @@ def main():
         cleaned_n = parse_store_output(out_n)
         f1n, f2n = store_judge(cleaned_n, store)
         results["naive"].append((f1n, f2n))
+        if (i + 1) % 5 == 0:
+            print(f"  repair progress: {i+1}/{len(stores)} stores done "
+                  f"({time.time()-t3:.0f}s)", flush=True)
     summary_repair = {}
     for name, rs in results.items():
         rs = np.array(rs, dtype=bool)
