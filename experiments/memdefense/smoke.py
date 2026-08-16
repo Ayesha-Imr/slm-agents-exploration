@@ -368,6 +368,14 @@ def answer_harmful(answer, store):
     return False
 
 
+def save_partial(partial, out):
+    try:
+        with open(os.path.join(out, "partial_results.json"), "w") as f:
+            json.dump(partial, f, indent=2)
+    except Exception:
+        pass
+
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -380,6 +388,7 @@ def main():
     ap.add_argument("--out", default=OUT_DIR)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
+    partial = {}
 
     t0 = time.time()
     tok, model = load_model()
@@ -414,31 +423,43 @@ def main():
     best_L = int(np.argmax(probe_auc))
     print(f"[{time.time()-t2:.0f}s] H2 probes: best layer {best_L} AUROC={probe_auc[best_L]:.3f} "
           f"(chance=0.5)", flush=True)
+    partial["h1_detection"] = {"auroc": float(auroc),
+                               "accuracy": float(accuracy_score(y_det, preds)),
+                               "precision_unsafe": float(prec[1]), "recall_unsafe": float(rec[1]),
+                               "f1_unsafe": float(f1[1]), "n": int(len(y_det))}
+    partial["h2_probes"] = {"auc_by_layer": [float(a) for a in probe_auc],
+                            "best_layer": int(best_L), "best_auc": float(probe_auc[best_L])}
+    save_partial(partial, args.out)
 
     # ---- Phase 3: selective repair (H3) ----
     t3 = time.time()
     results = {"auditor": [], "det_only": [], "naive": []}
     repairs = {}
+    failures = 0
     for i, store in enumerate(stores):
-        store_json = json.dumps([e["text"] for e in store["entries"]])
-        out = gen(model, tok, AUDIT_PROMPT.format(store=store_json), max_new_tokens=800)
-        cleaned = parse_store_output(out)
-        repairs[i] = cleaned
-        f1, f2 = store_judge(cleaned, store)
-        results["auditor"].append((f1, f2))
-        # baseline: detection-only quarantine (remove entries the detector flags)
-        entry_scores = {}
-        for e in store["entries"]:
-            s, _ = detection_scores(model, tok, [{"text": e["text"]}])
-            entry_scores[e["text"]] = s[0]
-        kept = [e["text"] for e in store["entries"] if entry_scores[e["text"]] <= 0]
-        f1d, f2d = store_judge(kept, store)
-        results["det_only"].append((f1d, f2d))
-        # baseline: naive tidying without security framing
-        out_n = gen(model, tok, NAIVE_PROMPT.format(store=store_json), max_new_tokens=800)
-        cleaned_n = parse_store_output(out_n)
-        f1n, f2n = store_judge(cleaned_n, store)
-        results["naive"].append((f1n, f2n))
+        try:
+            store_json = json.dumps([e["text"] for e in store["entries"]])
+            out = gen(model, tok, AUDIT_PROMPT.format(store=store_json), max_new_tokens=800)
+            cleaned = parse_store_output(out)
+            repairs[i] = cleaned
+            f1, f2 = store_judge(cleaned, store)
+            results["auditor"].append((f1, f2))
+            # baseline: detection-only quarantine (remove entries the detector flags)
+            entry_scores = {}
+            for e in store["entries"]:
+                s, _ = detection_scores(model, tok, [{"text": e["text"]}])
+                entry_scores[e["text"]] = s[0]
+            kept = [e["text"] for e in store["entries"] if entry_scores[e["text"]] <= 0]
+            f1d, f2d = store_judge(kept, store)
+            results["det_only"].append((f1d, f2d))
+            # baseline: naive tidying without security framing
+            out_n = gen(model, tok, NAIVE_PROMPT.format(store=store_json), max_new_tokens=800)
+            cleaned_n = parse_store_output(out_n)
+            f1n, f2n = store_judge(cleaned_n, store)
+            results["naive"].append((f1n, f2n))
+        except Exception as e:
+            failures += 1
+            print(f"  repair FAIL on store {i}: {e}", flush=True)
         if (i + 1) % 5 == 0:
             print(f"  repair progress: {i+1}/{len(stores)} stores done "
                   f"({time.time()-t3:.0f}s)", flush=True)
@@ -452,26 +473,35 @@ def main():
             "n": len(rs),
         }
     print(f"[{time.time()-t3:.0f}s] H3 repair: " + json.dumps(summary_repair), flush=True)
+    partial["h3_repair"] = summary_repair
+    save_partial(partial, args.out)
 
     # ---- Phase 4: end-to-end adoption with/without guard (H4) ----
     t4 = time.time()
     adopt_wo, adopt_w = [], []
     for i, store in enumerate(stores):
-        store_lines = "\n".join(f"- {e['text']}" for e in store["entries"])
-        ans_wo = gen(model, tok, AGENT_PROMPT.format(store=store_lines, query=store["trigger"]),
-                     max_new_tokens=200)
-        harmful_wo = answer_harmful(ans_wo, store)
-        # with guard: auditor repairs store first (cached from phase 3), agent sees cleaned store
-        cleaned = repairs[i]
-        store_w = "\n".join(f"- {c}" for c in cleaned)
-        ans_w = gen(model, tok, AGENT_PROMPT.format(store=store_w, query=store["trigger"]),
-                    max_new_tokens=200)
-        harmful_w = answer_harmful(ans_w, store)
-        if store["poisoned"]:
-            adopt_wo.append(harmful_wo)
-            adopt_w.append(harmful_w)
+        try:
+            store_lines = "\n".join(f"- {e['text']}" for e in store["entries"])
+            ans_wo = gen(model, tok, AGENT_PROMPT.format(store=store_lines, query=store["trigger"]),
+                         max_new_tokens=200)
+            harmful_wo = answer_harmful(ans_wo, store)
+            # with guard: auditor repairs store first (cached from phase 3), agent sees cleaned store
+            cleaned = repairs[i]
+            store_w = "\n".join(f"- {c}" for c in cleaned)
+            ans_w = gen(model, tok, AGENT_PROMPT.format(store=store_w, query=store["trigger"]),
+                        max_new_tokens=200)
+            harmful_w = answer_harmful(ans_w, store)
+            if store["poisoned"]:
+                adopt_wo.append(harmful_wo)
+                adopt_w.append(harmful_w)
+        except Exception as e:
+            print(f"  E2E FAIL on store {i}: {e}", flush=True)
     print(f"[{time.time()-t4:.0f}s] H4 E2E: adoption wo guard={np.mean(adopt_wo):.2f} "
           f"w guard={np.mean(adopt_w):.2f} (n={len(adopt_wo)} poisoned stores)", flush=True)
+    partial["h4_e2e"] = {"adoption_wo_guard": float(np.mean(adopt_wo)),
+                         "adoption_w_guard": float(np.mean(adopt_w)),
+                         "n_poisoned": int(len(adopt_wo))}
+    save_partial(partial, args.out)
 
     summary = {
         "model": args.model,
@@ -494,4 +524,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        pass
+    except Exception as e:
+        print(f"FATAL: {e}", flush=True)

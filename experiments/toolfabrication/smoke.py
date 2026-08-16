@@ -319,6 +319,21 @@ def main():
           f"no_call={s_labels.count('no_call')/max(1,len(s_labels)):.3f} "
           f"(n={len(s_labels)})", flush=True)
 
+    def save_partial(p):
+        try:
+            with open(os.path.join(args.out, "partial_results.json"), "w") as f:
+                json.dump(p, f, indent=2)
+        except Exception:
+            pass
+
+    partial = {"h1_rates_greedy": rates,
+               "h1_fabricated_total_greedy": float(total_fab),
+               "h1_fabricated_sampled": float(sampled_fab)}
+    save_partial(partial)
+    with open(os.path.join(args.out, "outputs.jsonl"), "w") as f:
+        for o in outputs:
+            f.write(json.dumps(o) + "\n")
+
     # ---- Phase 2: probes (H2) ----
     # hidden_states layout: [0]=embed, [1..N]=layers 0..N-1, [N+1]=final norm.
     # Probe only the real layers; state idx = probe idx, model layer = probe idx - 1.
@@ -356,6 +371,16 @@ def main():
              f"AUROC={auc_call[probe_layers.index(best_call)]:.3f}"
              if auc_call is not None else "call-vs-nocall skipped (class imbalance)"),
           flush=True)
+    partial["h2_probe_fab_vs_valid"] = ({"auc_by_layer": [float(a) for a in auc_fab_prompt],
+                                         "best_probe_layer": int(best_fab),
+                                         "best_model_layer": int(best_fab) - 1,
+                                         "best_auc": float(auc_fab_prompt[probe_layers.index(best_fab)])}
+                                        if auc_fab_prompt is not None else None)
+    partial["h2_probe_call_vs_nocall"] = ({"best_probe_layer": int(best_call),
+                                           "best_model_layer": int(best_call) - 1,
+                                           "best_auc": float(auc_call[probe_layers.index(best_call)])}
+                                          if auc_call is not None else None)
+    save_partial(partial)
 
     # ---- Phase 3: steering (H3) ----
     t3 = time.time()
@@ -386,6 +411,8 @@ def main():
                 "fabricated_rate": labs.count("fabricated") / len(labs),
             }
         print(f"[{time.time()-t3:.0f}s] H3a toolness steering: {json.dumps(steer_tool)}", flush=True)
+    partial["h3a_steer_toolness"] = steer_tool
+    save_partial(partial)
 
     # grounding steering: push valid-call queries toward the "fabricated" side
     t3b = time.time()
@@ -413,6 +440,8 @@ def main():
               flush=True)
     else:
         print("H3b skipped: too few fabricated samples for a grounding probe", flush=True)
+    partial["h3b_steer_grounding"] = steer_ground
+    save_partial(partial)
 
     # ---- Phase 4: registry corruption (H4) ----
     t4 = time.time()
@@ -450,6 +479,12 @@ def main():
               flush=True)
     else:
         fab_corrupt = None
+    partial["h4_corruption"] = {"fabricated_rate": float(fab_corrupt) if fab_corrupt is not None
+                                else None,
+                                "probe_score_shift_mean": float(np.mean(score_shifts))
+                                if score_shifts else None,
+                                "n": len(corrupt_labs)}
+    save_partial(partial)
 
     summary = {
         "model": args.model,
@@ -491,4 +526,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        pass
+    except Exception as e:
+        print(f"FATAL: {e}", flush=True)
