@@ -96,8 +96,27 @@ def build_prompt(tok, tools, question):
 
 CALL_RE = re.compile(r"\[\s*([A-Za-z_]\w*)\s*\(")
 JSON_NAME_RE = re.compile(r"\{[^{}]*\"name\"\s*:\s*\"([A-Za-z_][\w.]*)\"")
-ANY_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(\s*['\"]")
+ANY_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\([^)]")
 TOOLCALL_TAG_RE = re.compile(r"<tool_call>\s*\{.*?\"name\"\s*:\s*\"([^\"]+)\"", re.S)
+NONTOOL_WORDS = {"note", "see", "e.g", "i.e", "such", "like", "call", "use", "if",
+                 "or", "and", "not", "no", "so", "then", "please", "here", "this",
+                 "that", "example", "cases", "case", "check", "request", "answer",
+                 "because", "since", "while", "before", "after", "for", "with"}
+
+
+def parse_calls(text):
+    names = [m.group(1) for m in CALL_RE.finditer(text)]
+    if names:
+        return names
+    names = [m.group(1) for m in JSON_NAME_RE.finditer(text)]
+    if names:
+        return names
+    names = [m.group(1) for m in TOOLCALL_TAG_RE.finditer(text)]
+    if names:
+        return names
+    names = [m.group(1) for m in ANY_CALL_RE.finditer(text)]
+    names = [n for n in names if n.lower() not in NONTOOL_WORDS]
+    return names[:3]
 
 
 def parse_calls(text):
@@ -208,6 +227,7 @@ def main():
     ap.add_argument("--n-steer-tool", type=int, default=80)
     ap.add_argument("--n-steer-ground", type=int, default=60)
     ap.add_argument("--n-corrupt", type=int, default=40)
+    ap.add_argument("--verbose", type=int, default=0)
     ap.add_argument("--out", default=OUT_DIR)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -249,11 +269,18 @@ def main():
     first_tok_states = []
     labels = []
     calls_list = []
-    for q in queries:
+    outputs = []
+    for qi, q in enumerate(queries):
         text, ps, fs = gen(model, tok, q["prompt"], max_new_tokens=220)
         lab, calls = label_output(text, q["registry"], q["gts"])
         labels.append(lab)
         calls_list.append(calls)
+        outputs.append({"qid": qi, "item_id": q["item_id"], "category": q["category"],
+                        "registry": q["registry"], "raw": text, "calls": calls,
+                        "label": lab})
+        if qi < args.verbose:
+            print(f"--- verbose [{qi}] cat={q['category']} registry={q['registry']} "
+                  f"label={lab} calls={calls}\nRAW: {text[:400]}\n", flush=True)
         prompt_states.append(ps)
         if fs is not None:
             first_tok_states.append(fs)
@@ -317,8 +344,10 @@ def main():
         best_call = int(np.argmax(auc_call))
     else:
         auc_call, best_call = None, None
-    print(f"[{time.time()-t2:.0f}s] H2 probes: fab-vs-valid best L={best_fab} "
-          f"AUROC={auc_fab_prompt[best_fab]:.3f} (prompt-final) | "
+    print(f"[{time.time()-t2:.0f}s] H2 probes: "
+          + (f"fab-vs-valid best L={best_fab} AUROC={auc_fab_prompt[best_fab]:.3f} (prompt-final)"
+             if auc_fab_prompt is not None else "fab-vs-valid skipped (class imbalance)")
+          + " | "
           + (f"call-vs-nocall best L={best_call} AUROC={auc_call[best_call]:.3f}"
              if auc_call is not None else "call-vs-nocall skipped (class imbalance)"),
           flush=True)
@@ -446,6 +475,9 @@ def main():
     out_path = os.path.join(args.out, "results.json")
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
+    with open(os.path.join(args.out, "outputs.jsonl"), "w") as f:
+        for o in outputs:
+            f.write(json.dumps(o) + "\n")
     print("FINAL_SUMMARY " + json.dumps(summary), flush=True)
     print(f"results saved to {out_path}", flush=True)
 
