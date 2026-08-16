@@ -1,0 +1,47 @@
+# Defaults shared by every project using this Lambda setup.
+# Region and filesystem are fixed together: Lambda filesystems are created in
+# one region and can never move, and can only be attached to an instance at
+# launch time. So once `filesystem` below is set, `region` MUST match the
+# region that filesystem actually lives in - check with:
+#   python lambda/lambda_cli.py filesystems
+
+# Confirmed live 2026-08-15. Root cause of an earlier "filesystem invisible
+# to the API" mystery: the API key is scoped to the account's DEFAULT
+# workspace, not whichever team ("ICs") happens to be active in the console
+# UI - a filesystem created under a non-default team is invisible to a
+# default-workspace key even though the console makes both look consistent.
+# ic-fs-2 was created directly in the default workspace and works.
+filesystem: "ic-fs-2"
+region: "us-east-1"
+
+# SSH key registered with Lambda (see README) used to access every pod.
+# "lambda-public-key" is the name Lambda's console already has this exact
+# key registered under - confirmed by diffing it against
+# ~/.ssh/lambda_id_ed25519.pub, byte for byte identical. No need to
+# register a new one.
+ssh_key_name: "lambda-public-key"
+ssh_public_key_file: "~/.ssh/lambda_id_ed25519.pub"
+ssh_private_key_file: "~/.ssh/lambda_id_ed25519"
+
+# GPU tiers to try, in priority order, when no --instance-type is given.
+# Matched as a case-insensitive SUBSTRING against Lambda instance_type_name,
+# which is why every entry here must name the GPU COUNT explicitly.
+#
+# This list previously led with "a100_80gb_sxm4" on the reasoning that Lambda
+# does not sell a single-GPU 80GB A100, so it could only ever match the 8x
+# bundle, which never had capacity. On 2026-08-15 that bundle DID have
+# capacity: the substring matched gpu_8x_a100_80gb_sxm4 and launched a
+# $22.32/hr 8-GPU node instead of the intended $1.99 single card. Never list a
+# bare tier name here and rely on capacity to keep it from matching.
+preferred_instance_types:
+  - "gpu_1x_a100_sxm4"
+  - "gpu_1x_a100"
+
+# Optional, OFF by default: you chose explicit-stop-only (no watchdog, no
+# hard cap) as the idle-safety policy, so bin/run.sh's primary and only
+# built-in mechanism is stopping the pod itself when the run finishes or
+# fails (see the trap in bin/run.sh). If you ever want an extra backstop for
+# unattended/overnight runs, set this to a number of hours and bin/run.sh
+# will background a timer that force-stops the pod if it's still up past
+# that point. Leave empty ("") to keep the no-cap behavior you chose.
+max_runtime_hours: "5"

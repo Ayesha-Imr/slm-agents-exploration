@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+results/
+*.npz
+
+# never track these (user request)
+.claude/
+docs/
+AGENTS.md
