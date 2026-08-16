@@ -174,7 +174,16 @@ ssh "${SSH_OPTS[@]}" "$SSH_USER@$IP" bash -s <<EOF
 set -euo pipefail
 mkdir -p "$POD_WORKSPACE/repos"
 export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new"
-if [ -d "$REMOTE_REPO_DIR/.git" ]; then
+# A sibling pod may be cloning this same repo right now; wait until its clone
+# is complete (HEAD present) rather than mistaking a half-initialized .git
+# for a ready repo.
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if [ -d "$REMOTE_REPO_DIR/.git" ] && [ -e "$REMOTE_REPO_DIR/.git/HEAD" ]; then
+        break
+    fi
+    sleep 5
+done
+if [ -d "$REMOTE_REPO_DIR/.git" ] && [ -e "$REMOTE_REPO_DIR/.git/HEAD" ]; then
     cd "$REMOTE_REPO_DIR" && git fetch origin && git checkout "$BRANCH" && git pull origin "$BRANCH"
 else
     git clone --branch "$BRANCH" "$REPO" "$REMOTE_REPO_DIR"
