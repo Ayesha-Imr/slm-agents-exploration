@@ -524,9 +524,11 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
     try:
         main()
     except BrokenPipeError:
         pass
     except Exception as e:
         print(f"FATAL: {e}", flush=True)
+        sys.exit(1)

@@ -162,7 +162,7 @@ def gen(model, tok, prompt, max_new_tokens=220, do_sample=False, temperature=1.0
         direction = torch.tensor(steer_dir, dtype=torch.bfloat16, device=model.device)
         direction = direction / (direction.norm() + 1e-8) * steer_alpha
 
-        def hook(module, args):
+        def hook(module, args, output=None):
             hs = args[0]
             hs = hs.clone()
             hs[:, -1:, :] += direction
@@ -228,6 +228,7 @@ def main():
     ap.add_argument("--n-steer-tool", type=int, default=80)
     ap.add_argument("--n-steer-ground", type=int, default=60)
     ap.add_argument("--n-corrupt", type=int, default=40)
+    ap.add_argument("--resume", action="store_true")
     ap.add_argument("--verbose", type=int, default=0)
     ap.add_argument("--out", default=OUT_DIR)
     args = ap.parse_args()
@@ -256,39 +257,61 @@ def main():
 
     # ---- Phase 1: generation + labeling (H1) ----
     t1 = time.time()
-    queries = []  # dict: prompt, registry, gts, category, item
-    for key, items in sets.items():
-        for it in items:
-            tools = item_tools(it)
-            registry = [t["name"] for t in tools]
-            gts = gt_names(it)
-            prompt = build_prompt(tok, tools, item_question(it))
-            queries.append({"prompt": prompt, "registry": registry, "gts": gts,
-                            "category": key, "item_id": it.get("id"), "item": it})
+    cache_path = os.path.join(args.out, "h1_cache.npz")
+    queries_path = os.path.join(args.out, "h1_queries.json")
+    labels_path = os.path.join(args.out, "h1_labels.json")
+    if args.resume and os.path.exists(cache_path) and os.path.exists(queries_path):
+        with open(queries_path) as f:
+            queries = json.load(f)
+        with open(labels_path) as f:
+            labels = json.load(f)
+        z = np.load(cache_path)
+        P = z["P"]
+        F = z["F"] if "F" in z else None
+        calls_list = [[] for _ in queries]
+        outputs = []
+        print(f"[{time.time()-t0:.0f}s] resumed from cache: {len(queries)} queries, "
+              f"P {P.shape}", flush=True)
+    else:
+        queries = []  # dict: prompt, registry, gts, category, item
+        for key, items in sets.items():
+            for it in items:
+                tools = item_tools(it)
+                registry = [t["name"] for t in tools]
+                gts = gt_names(it)
+                prompt = build_prompt(tok, tools, item_question(it))
+                queries.append({"prompt": prompt, "registry": registry, "gts": gts,
+                                "category": key, "item_id": it.get("id"), "item": it})
 
-    prompt_states = []
-    first_tok_states = []
-    labels = []
-    calls_list = []
-    outputs = []
-    for qi, q in enumerate(queries):
-        text, ps, fs = gen(model, tok, q["prompt"], max_new_tokens=220)
-        lab, calls = label_output(text, q["registry"], q["gts"])
-        labels.append(lab)
-        calls_list.append(calls)
-        outputs.append({"qid": qi, "item_id": q["item_id"], "category": q["category"],
-                        "registry": q["registry"], "raw": text, "calls": calls,
-                        "label": lab})
-        if qi < args.verbose:
-            print(f"--- verbose [{qi}] cat={q['category']} registry={q['registry']} "
-                  f"label={lab} calls={calls}\nRAW: {text[:400]}\n", flush=True)
-        prompt_states.append(ps)
-        if fs is not None:
-            first_tok_states.append(fs)
-        else:
-            first_tok_states.append(np.zeros_like(ps))
-    P = np.stack(prompt_states)            # (N, L, D)
-    F = np.stack(first_tok_states) if first_tok_states else None
+        prompt_states = []
+        first_tok_states = []
+        labels = []
+        calls_list = []
+        outputs = []
+        for qi, q in enumerate(queries):
+            text, ps, fs = gen(model, tok, q["prompt"], max_new_tokens=220)
+            lab, calls = label_output(text, q["registry"], q["gts"])
+            labels.append(lab)
+            calls_list.append(calls)
+            outputs.append({"qid": qi, "item_id": q["item_id"], "category": q["category"],
+                            "registry": q["registry"], "raw": text, "calls": calls,
+                            "label": lab})
+            if qi < args.verbose:
+                print(f"--- verbose [{qi}] cat={q['category']} registry={q['registry']} "
+                      f"label={lab} calls={calls}\nRAW: {text[:400]}\n", flush=True)
+            prompt_states.append(ps)
+            if fs is not None:
+                first_tok_states.append(fs)
+            else:
+                first_tok_states.append(np.zeros_like(ps))
+        P = np.stack(prompt_states)            # (N, L, D)
+        F = np.stack(first_tok_states) if first_tok_states else None
+        np.savez(cache_path, P=P, F=F)
+        with open(queries_path, "w") as f:
+            json.dump(queries, f)
+        with open(labels_path, "w") as f:
+            json.dump(labels, f)
+        print(f"[{time.time()-t0:.0f}s] H1 cache saved: {cache_path}", flush=True)
 
     rates = {}
     for key in counts:
@@ -306,18 +329,22 @@ def main():
 
     # sampled subset (fabrication-prone categories)
     t1b = time.time()
-    sampled_pool = [q for q in queries if q["category"] in ("irrel", "live_irrel", "live_rel")]
-    sampled_pool = rng.sample(sampled_pool, min(args.n_sampled, len(sampled_pool)))
-    s_labels = []
-    for q in sampled_pool:
-        text, _, _ = gen(model, tok, q["prompt"], max_new_tokens=220, do_sample=True,
-                         temperature=1.0)
-        lab, _ = label_output(text, q["registry"], q["gts"])
-        s_labels.append(lab)
-    sampled_fab = s_labels.count("fabricated") / max(1, len(s_labels))
-    print(f"[{time.time()-t1b:.0f}s] H1 sampled(temp=1): fabricated={sampled_fab:.3f} "
-          f"no_call={s_labels.count('no_call')/max(1,len(s_labels)):.3f} "
-          f"(n={len(s_labels)})", flush=True)
+    sampled_fab = None
+    s_n = 0
+    if not args.resume:
+        sampled_pool = [q for q in queries if q["category"] in ("irrel", "live_irrel", "live_rel")]
+        sampled_pool = rng.sample(sampled_pool, min(args.n_sampled, len(sampled_pool)))
+        s_labels = []
+        for q in sampled_pool:
+            text, _, _ = gen(model, tok, q["prompt"], max_new_tokens=220, do_sample=True,
+                             temperature=1.0)
+            lab, _ = label_output(text, q["registry"], q["gts"])
+            s_labels.append(lab)
+        sampled_fab = s_labels.count("fabricated") / max(1, len(s_labels))
+        s_n = len(s_labels)
+        print(f"[{time.time()-t1b:.0f}s] H1 sampled(temp=1): fabricated={sampled_fab:.3f} "
+              f"no_call={s_labels.count('no_call')/max(1,len(s_labels)):.3f} "
+              f"(n={len(s_labels)})", flush=True)
 
     def save_partial(p):
         try:
@@ -328,11 +355,12 @@ def main():
 
     partial = {"h1_rates_greedy": rates,
                "h1_fabricated_total_greedy": float(total_fab),
-               "h1_fabricated_sampled": float(sampled_fab)}
+               "h1_fabricated_sampled": float(sampled_fab) if sampled_fab is not None else None}
     save_partial(partial)
-    with open(os.path.join(args.out, "outputs.jsonl"), "w") as f:
-        for o in outputs:
-            f.write(json.dumps(o) + "\n")
+    if outputs:
+        with open(os.path.join(args.out, "outputs.jsonl"), "w") as f:
+            for o in outputs:
+                f.write(json.dumps(o) + "\n")
 
     # ---- Phase 2: probes (H2) ----
     # hidden_states layout: [0]=embed, [1..N]=layers 0..N-1, [N+1]=final norm.
@@ -491,7 +519,7 @@ def main():
         "n_queries": len(queries),
         "h1_rates_greedy": rates,
         "h1_fabricated_total_greedy": float(total_fab),
-        "h1_fabricated_sampled": float(sampled_fab),
+        "h1_fabricated_sampled": float(sampled_fab) if sampled_fab is not None else None,
         "h2_probe_fab_vs_valid": {"auc_by_layer": [float(a) for a in auc_fab_prompt],
                                   "best_probe_layer": int(best_fab),
                                   "best_model_layer": int(best_fab) - 1,
@@ -526,9 +554,11 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
     try:
         main()
     except BrokenPipeError:
         pass
     except Exception as e:
         print(f"FATAL: {e}", flush=True)
+        sys.exit(1)
