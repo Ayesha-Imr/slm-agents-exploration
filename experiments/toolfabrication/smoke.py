@@ -39,14 +39,6 @@ MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 OUT_DIR = os.environ.get("SMOKE_OUT", "results/toolfabrication")
 BFCL_REPO = "gorilla-llm/Berkeley-Function-Calling-Leaderboard"
 
-SYS_HEAD = (
-    "You are an expert in composing functions. You are given a question and a set of "
-    "possible functions. Based on the question, you will need to make one or more "
-    "function/tool calls to achieve the purpose.\nIf none of the functions can be used, "
-    "point it out.\nIf the given question lacks the parameters required by the function, "
-    "also point it out.\nHere is a list of functions in JSON format that you can invoke:\n"
-)
-
 
 def load_bfcl(filename):
     path = hf_hub_download(BFCL_REPO, filename, repo_type="dataset")
@@ -88,10 +80,19 @@ def gt_names(item):
 
 
 def build_prompt(tok, tools, question):
-    sys_msg = SYS_HEAD + json.dumps(tools)
+    sys_msg = (
+        "You are a helpful assistant with access to the following functions. "
+        "Use the functions when they are relevant to the user's request. "
+        "If no function is relevant, or required parameters are missing, say so "
+        "instead of calling a function."
+    )
     msgs = [{"role": "system", "content": sys_msg},
             {"role": "user", "content": question}]
-    return tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+    kwargs = {}
+    if tools:
+        kwargs["tools"] = tools
+    return tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False,
+                                   **kwargs)
 
 
 CALL_RE = re.compile(r"\[\s*([A-Za-z_]\w*)\s*\(")
@@ -105,13 +106,13 @@ NONTOOL_WORDS = {"note", "see", "e.g", "i.e", "such", "like", "call", "use", "if
 
 
 def parse_calls(text):
+    names = [m.group(1) for m in TOOLCALL_TAG_RE.finditer(text)]
+    if names:
+        return names
     names = [m.group(1) for m in CALL_RE.finditer(text)]
     if names:
         return names
     names = [m.group(1) for m in JSON_NAME_RE.finditer(text)]
-    if names:
-        return names
-    names = [m.group(1) for m in TOOLCALL_TAG_RE.finditer(text)]
     if names:
         return names
     names = [m.group(1) for m in ANY_CALL_RE.finditer(text)]
@@ -288,7 +289,6 @@ def main():
             first_tok_states.append(np.zeros_like(ps))
     P = np.stack(prompt_states)            # (N, L, D)
     F = np.stack(first_tok_states) if first_tok_states else None
-    n_layers = P.shape[1]
 
     rates = {}
     for key in counts:
@@ -320,18 +320,21 @@ def main():
           f"(n={len(s_labels)})", flush=True)
 
     # ---- Phase 2: probes (H2) ----
+    # hidden_states layout: [0]=embed, [1..N]=layers 0..N-1, [N+1]=final norm.
+    # Probe only the real layers; state idx = probe idx, model layer = probe idx - 1.
     t2 = time.time()
+    probe_layers = list(range(1, len(model.model.layers) + 1))
     y_fab = np.array([1 if l == "fabricated" else 0 for l in labels
                       if l in ("fabricated", "correct", "wrong_tool")])
     idx_fab = [i for i, l in enumerate(labels) if l in ("fabricated", "correct", "wrong_tool")]
     if y_fab.sum() >= 4 and (len(y_fab) - y_fab.sum()) >= 4:
         Xf = P[idx_fab]
-        auc_fab_prompt = probe_aucs(Xf, y_fab, range(n_layers))
-        best_fab = int(np.argmax(auc_fab_prompt))
+        auc_fab_prompt = probe_aucs(Xf, y_fab, probe_layers)
+        best_fab = probe_layers[int(np.argmax(auc_fab_prompt))]
         if F is not None:
             Xf1 = F[idx_fab]
-            auc_fab_first = probe_aucs(Xf1, y_fab, range(n_layers))
-            best_fab_first = int(np.argmax(auc_fab_first))
+            auc_fab_first = probe_aucs(Xf1, y_fab, probe_layers)
+            best_fab_first = probe_layers[int(np.argmax(auc_fab_first))]
         else:
             auc_fab_first, best_fab_first = None, None
     else:
@@ -340,15 +343,17 @@ def main():
     y_call = np.array([1 if l in ("fabricated", "correct", "wrong_tool") else 0
                        for l in labels])
     if y_call.sum() >= 4 and (len(y_call) - y_call.sum()) >= 4:
-        auc_call = probe_aucs(P, y_call, range(n_layers))
-        best_call = int(np.argmax(auc_call))
+        auc_call = probe_aucs(P, y_call, probe_layers)
+        best_call = probe_layers[int(np.argmax(auc_call))]
     else:
         auc_call, best_call = None, None
     print(f"[{time.time()-t2:.0f}s] H2 probes: "
-          + (f"fab-vs-valid best L={best_fab} AUROC={auc_fab_prompt[best_fab]:.3f} (prompt-final)"
+          + (f"fab-vs-valid best L={best_fab} (model layer {best_fab-1}) "
+             f"AUROC={auc_fab_prompt[probe_layers.index(best_fab)]:.3f} (prompt-final)"
              if auc_fab_prompt is not None else "fab-vs-valid skipped (class imbalance)")
           + " | "
-          + (f"call-vs-nocall best L={best_call} AUROC={auc_call[best_call]:.3f}"
+          + (f"call-vs-nocall best L={best_call} (model layer {best_call-1}) "
+             f"AUROC={auc_call[probe_layers.index(best_call)]:.3f}"
              if auc_call is not None else "call-vs-nocall skipped (class imbalance)"),
           flush=True)
 
@@ -372,7 +377,7 @@ def main():
             labs = []
             for q in steer_pool:
                 text, _, _ = gen(model, tok, q["prompt"], max_new_tokens=220,
-                                 steer_layer=best_call, steer_dir=tool_dir, steer_alpha=alpha)
+                                 steer_layer=best_call - 1, steer_dir=tool_dir, steer_alpha=alpha)
                 lab, _ = label_output(text, q["registry"], q["gts"])
                 labs.append(lab)
             steer_tool[str(alpha)] = {
@@ -397,7 +402,7 @@ def main():
             for i in pool:
                 q = queries[i]
                 text, _, _ = gen(model, tok, q["prompt"], max_new_tokens=220,
-                                 steer_layer=best_fab, steer_dir=w, steer_alpha=alpha)
+                                 steer_layer=best_fab - 1, steer_dir=w, steer_alpha=alpha)
                 lab, _ = label_output(text, q["registry"], q["gts"])
                 labs.append(lab)
             steer_ground[str(alpha)] = {
@@ -453,15 +458,18 @@ def main():
         "h1_fabricated_total_greedy": float(total_fab),
         "h1_fabricated_sampled": float(sampled_fab),
         "h2_probe_fab_vs_valid": {"auc_by_layer": [float(a) for a in auc_fab_prompt],
-                                  "best_layer": int(best_fab),
-                                  "best_auc": float(auc_fab_prompt[best_fab])}
+                                  "best_probe_layer": int(best_fab),
+                                  "best_model_layer": int(best_fab) - 1,
+                                  "best_auc": float(auc_fab_prompt[probe_layers.index(best_fab)])}
         if auc_fab_prompt else None,
         "h2_probe_fab_first_token": {"auc_by_layer": [float(a) for a in auc_fab_first],
-                                     "best_layer": int(best_fab_first),
-                                     "best_auc": float(auc_fab_first[best_fab_first])}
+                                     "best_probe_layer": int(best_fab_first),
+                                     "best_model_layer": int(best_fab_first) - 1,
+                                     "best_auc": float(auc_fab_first[probe_layers.index(best_fab_first)])}
         if auc_fab_first else None,
-        "h2_probe_call_vs_nocall": ({"best_layer": int(best_call),
-                                     "best_auc": float(auc_call[best_call])}
+        "h2_probe_call_vs_nocall": ({"best_probe_layer": int(best_call),
+                                     "best_model_layer": int(best_call) - 1,
+                                     "best_auc": float(auc_call[probe_layers.index(best_call)])}
                                     if auc_call is not None else None),
         "h3a_steer_toolness": steer_tool,
         "h3b_steer_grounding": steer_ground,

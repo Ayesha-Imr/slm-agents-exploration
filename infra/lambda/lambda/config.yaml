@@ -44,4 +44,4 @@ preferred_instance_types:
 # unattended/overnight runs, set this to a number of hours and bin/run.sh
 # will background a timer that force-stops the pod if it's still up past
 # that point. Leave empty ("") to keep the no-cap behavior you chose.
-max_runtime_hours: "5"
+max_runtime_hours: "3"
