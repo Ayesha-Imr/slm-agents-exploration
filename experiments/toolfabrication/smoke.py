@@ -162,14 +162,14 @@ def gen(model, tok, prompt, max_new_tokens=220, do_sample=False, temperature=1.0
         direction = torch.tensor(steer_dir, dtype=torch.bfloat16, device=model.device)
         direction = direction / (direction.norm() + 1e-8) * steer_alpha
 
-        def hook(module, args, output=None, **kw):
-            hs = args[0] if not isinstance(args, tuple) or len(args) == 1 else args[0]
+        def hook(module, args):
+            hs = args[0]
             if not torch.is_tensor(hs):
-                raise TypeError(f"hook expected tensor input, got {type(hs)}")
+                raise TypeError(f"pre-hook expected tensor input, got {type(hs)}")
             hs = hs.clone()
             hs[:, -1:, :] += direction
             return (hs, *args[1:])
-        hooks.append(layer.register_forward_hook(hook))
+        hooks.append(layer.register_forward_pre_hook(hook))
     try:
         with torch.no_grad():
             out = model.generate(
