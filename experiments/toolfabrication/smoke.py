@@ -51,6 +51,24 @@ def load_bfcl(filename):
     return items
 
 
+def load_pa(filename):
+    """Ground-truth tool names per item id from the possible_answer/ dir."""
+    path = hf_hub_download(BFCL_REPO, f"possible_answer/{filename}", repo_type="dataset")
+    pa = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            gts = []
+            for entry in d.get("ground_truth", []):
+                if isinstance(entry, dict):
+                    gts.extend(entry.keys())
+            pa[d["id"]] = gts
+    return pa
+
+
 def item_question(item):
     q = item.get("question") or item.get("conversations")
     if isinstance(q, list) and q:
@@ -254,6 +272,18 @@ def main():
     for key, items in files.items():
         sets[key] = rng.sample(items, min(counts[key], len(items)))
 
+    pa_maps = {}
+    for key, filename in (("multiple", "BFCL_v3_multiple.json"),
+                          ("simple", "BFCL_v3_simple.json")):
+        try:
+            pa_maps[key] = load_pa(filename)
+        except Exception as e:
+            print(f"possible_answer load failed for {filename}: {e}", flush=True)
+            pa_maps[key] = {}
+
+    def resolve_gts(item, category):
+        return gt_names(item) or pa_maps.get(category, {}).get(item.get("id"), [])
+
     tok, model = load_model()
     print(f"[{time.time()-t0:.0f}s] model loaded: {args.model}", flush=True)
 
@@ -272,15 +302,41 @@ def main():
         F = z["F"] if "F" in z else None
         calls_list = [[] for _ in queries]
         outputs = []
+        # refresh ground truths (possible_answer join) and recompute labels
+        # from the saved raw outputs when available
+        outputs_path = os.path.join(args.out, "outputs.jsonl")
+        outmap = {}
+        if os.path.exists(outputs_path):
+            with open(outputs_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        o = json.loads(line)
+                        outmap[o["item_id"]] = o
+        for qi, q in enumerate(queries):
+            q["gts"] = resolve_gts(q["item"], q["category"])
+            o = outmap.get(q["item_id"])
+            if o is not None:
+                calls = o["calls"]
+                if not calls:
+                    labels[qi] = "no_call"
+                else:
+                    names = set(calls)
+                    if not names <= set(q["registry"]):
+                        labels[qi] = "fabricated"
+                    elif q["gts"] and (names & set(q["gts"])):
+                        labels[qi] = "correct"
+                    else:
+                        labels[qi] = "wrong_tool"
         print(f"[{time.time()-t0:.0f}s] resumed from cache: {len(queries)} queries, "
-              f"P {P.shape}", flush=True)
+              f"P {P.shape}, labels recomputed ({labels.count('correct')} correct)", flush=True)
     else:
         queries = []  # dict: prompt, registry, gts, category, item
         for key, items in sets.items():
             for it in items:
                 tools = item_tools(it)
                 registry = [t["name"] for t in tools]
-                gts = gt_names(it)
+                gts = resolve_gts(it, key)
                 prompt = build_prompt(tok, tools, item_question(it))
                 queries.append({"prompt": prompt, "registry": registry, "gts": gts,
                                 "category": key, "item_id": it.get("id"), "item": it})
@@ -421,9 +477,12 @@ def main():
         print(f"[{time.time()-t3:.0f}s] H3a toolness steering: SKIPPED "
               f"(no call/nocall contrast)", flush=True)
     else:
-        mean_call = P[call_idx, best_call].mean(axis=0)
-        mean_nocall = P[nocall_idx, best_call].mean(axis=0)
-        tool_dir = mean_call - mean_nocall
+        # steer with the classifier (probe) direction, not the class-mean diff
+        clf_call = LogisticRegression(max_iter=3000, C=1.0, class_weight="balanced")
+        y_call_all = np.array([1 if l in ("fabricated", "correct", "wrong_tool") else 0
+                               for l in labels])
+        clf_call.fit(P[:, best_call], y_call_all)
+        tool_dir = clf_call.coef_[0]
         tool_dir = tool_dir / (np.linalg.norm(tool_dir) + 1e-8)
 
         steer_pool = [q for q in queries if q["category"] in ("irrel", "live_irrel")]
@@ -462,10 +521,11 @@ def main():
                                  steer_layer=best_fab - 1, steer_dir=w, steer_alpha=alpha)
                 lab, _ = label_output(text, q["registry"], q["gts"])
                 labs.append(lab)
-            steer_ground[str(alpha)] = {
-                "fabricated_rate": labs.count("fabricated") / len(labs),
-                "valid_rate": sum(1 for l in labs if l in ("correct", "wrong_tool")) / len(labs),
-            }
+            if labs:
+                steer_ground[str(alpha)] = {
+                    "fabricated_rate": labs.count("fabricated") / len(labs),
+                    "valid_rate": sum(1 for l in labs if l in ("correct", "wrong_tool")) / len(labs),
+                }
         print(f"[{time.time()-t3b:.0f}s] H3b grounding steering: {json.dumps(steer_ground)}",
               flush=True)
     else:
