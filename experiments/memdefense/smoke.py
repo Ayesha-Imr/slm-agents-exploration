@@ -405,10 +405,10 @@ def main():
     scores, states = detection_scores(model, tok, det_entries)
     auroc = roc_auc_score(y_det, scores)
     preds = (scores > 0).astype(int)
-    prec, rec, f1, _ = precision_recall_fscore_support(y_det, preds, zero_division=0)
+    prec_h1, rec_h1, f1_h1, _ = precision_recall_fscore_support(y_det, preds, zero_division=0)
     print(f"[{time.time()-t1:.0f}s] H1 prompted detection: AUROC={auroc:.3f} "
-          f"acc={accuracy_score(y_det, preds):.3f} prec(unsafe)={prec[1]:.3f} "
-          f"rec(unsafe)={rec[1]:.3f} f1={f1[1]:.3f}", flush=True)
+          f"acc={accuracy_score(y_det, preds):.3f} prec(unsafe)={prec_h1[1]:.3f} "
+          f"rec(unsafe)={rec_h1[1]:.3f} f1={f1_h1[1]:.3f}", flush=True)
 
     # ---- Phase 2: linear probes per layer (H2) ----
     t2 = time.time()
@@ -425,8 +425,8 @@ def main():
           f"(chance=0.5)", flush=True)
     partial["h1_detection"] = {"auroc": float(auroc),
                                "accuracy": float(accuracy_score(y_det, preds)),
-                               "precision_unsafe": float(prec[1]), "recall_unsafe": float(rec[1]),
-                               "f1_unsafe": float(f1[1]), "n": int(len(y_det))}
+                               "precision_unsafe": float(prec_h1[1]), "recall_unsafe": float(rec_h1[1]),
+                               "f1_unsafe": float(f1_h1[1]), "n": int(len(y_det))}
     partial["h2_probes"] = {"auc_by_layer": [float(a) for a in probe_auc],
                             "best_layer": int(best_L), "best_auc": float(probe_auc[best_L])}
     save_partial(partial, args.out)
@@ -506,8 +506,8 @@ def main():
     summary = {
         "model": args.model,
         "h1_detection": {"auroc": float(auroc), "accuracy": float(accuracy_score(y_det, preds)),
-                         "precision_unsafe": float(prec[1]), "recall_unsafe": float(rec[1]),
-                         "f1_unsafe": float(f1[1]), "n": int(len(y_det))},
+                         "precision_unsafe": float(prec_h1[1]), "recall_unsafe": float(rec_h1[1]),
+                         "f1_unsafe": float(f1_h1[1]), "n": int(len(y_det))},
         "h2_probes": {"auc_by_layer": [float(a) for a in probe_auc],
                       "best_layer": int(best_L), "best_auc": float(probe_auc[best_L])},
         "h3_repair": summary_repair,
