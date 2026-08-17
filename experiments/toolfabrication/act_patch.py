@@ -66,7 +66,7 @@ def cache_ctx_states(model, tok, prompt, R):
     assert len(hs_all) >= n_layers + 1, f"hidden_states len {len(hs_all)} != {n_layers}+1"
     ctx = {}
     for L in range(n_layers):
-        ctx[L] = hs_all[L + 1][0, :R, :].to(torch.bfloat16).cpu().numpy()
+        ctx[L] = hs_all[L + 1][0, :R, :].float().cpu().numpy()
     return ctx
 
 
